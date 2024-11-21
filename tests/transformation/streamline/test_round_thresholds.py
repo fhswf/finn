@@ -27,15 +27,33 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# fmt: off
+# Disable formatter. This is deliberately formatted to stay within 80 characters
+# per line. Black, however, formats some lines going beyond this.
+
+# Testing framework
 import pytest
 
+# Use numpy for python execution / computing the ground truth expected values
 import numpy as np
+
+# Utility types and function for creating onnx nodes and graphs
 from onnx import TensorProto, helper
+
+# QONNX data types like INT25
 from qonnx.core.datatype import DataType
+
+# QONNX wrapper of ONNX model graphs
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.util.basic import gen_finn_dt_tensor
 
+# Generate random tensors of QONNX/FINN data types for testing
+from qonnx.util.basic import gen_finn_dt_tensor
+
+# Execution of onnx graphs within FINN
 import finn.core.onnx_exec as oxe
+
+# The transformation to be tested
 from finn.transformation.streamline import RoundAndClipThresholds
 
 

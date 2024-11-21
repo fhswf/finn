@@ -27,6 +27,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# Need numpy for modifying the onnx graph tensors, which are numpy style arrays
 import numpy as np
 from qonnx.core.datatype import DataType
 from qonnx.core.modelwrapper import ModelWrapper
@@ -34,7 +35,13 @@ from qonnx.custom_op.registry import getCustomOp
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.infer_datatypes import InferDataTypes
 
+# Transformation running qonnx datatype inference
+from qonnx.transformation.infer_datatypes import InferDataTypes
 
+
+# Rounds and clips thresholds to integer values if the node inputs are integer,
+# respecting range, representability and data type (promotion) of the container
+# data type
 class RoundAndClipThresholds(Transformation):
     """For MultiThreshold nodes operating on integer inputs, round up
     thresholds values to the nearest integer. Additionally, if the input
@@ -45,6 +52,7 @@ class RoundAndClipThresholds(Transformation):
 
     def apply(self, model: ModelWrapper):  # noqa
         graph = model.graph
+        # Keep track of whether the graph has been modified
         graph_modified = False
         for index, node in enumerate(graph.node):
             op_type = node.op_type
