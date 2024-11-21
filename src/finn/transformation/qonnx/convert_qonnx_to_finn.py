@@ -72,8 +72,6 @@ class ConvertQONNXtoFINN(Transformation):
         self._filter_function = filter_function
 
     def apply(self, model):
-        # Extract the bias from Conv node
-        model = model.transform(ExtractBiasFromConv())
         # Gemm operations are not supported by FINN, so we convert them to MatMul
         model = model.transform(GemmToMatMul())
         model = model.transform(FoldTransposeIntoQuantInit())
@@ -81,6 +79,8 @@ class ConvertQONNXtoFINN(Transformation):
         model = model.transform(InferDataTypes())
         # Fold weights
         model = model.transform(FoldQuantWeights())
+        # Extract the bias from Conv node
+        model = model.transform(ExtractBiasFromConv())
         # Convert activations
         model = model.transform(
             ConvertQuantActToMultiThreshold(

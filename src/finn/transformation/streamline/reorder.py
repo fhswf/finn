@@ -349,6 +349,33 @@ class MoveScalarMulPastConv(Transformation):
                         graph.node.remove(mul_node)
                         graph.node.insert(node_ind, mul_node)
                         graph_modified = True
+            elif model.is_fork_node(n):
+                    consumers = model.find_consumers(n.output[0])
+                    if all(c.op_type == "Conv" for c in consumers):
+                        mul_weight_name = n.input[1]
+                        A = model.get_initializer(mul_weight_name)
+                        if A is None:
+                            warnings.warn("Mul param is not constant, skipping")
+                            continue
+
+                        if all(x == 1 for x in A.shape):
+                            for consumer in consumers:
+                                mul_input_name = model.make_new_valueinfo_name()
+                                mul_input = oh.make_tensor_value_info(mul_input_name, TensorProto.FLOAT, model.get_tensor_shape(consumer.output[0]))
+                                graph.value_info.append(mul_input)
+                                new_mul = oh.make_node(
+                                    "Mul",
+                                    inputs=[mul_input_name, mul_weight_name],
+                                    outputs=[consumer.output[0]],
+                                    name=f"{n.name}_{consumer.name}"
+                                )
+                                consumer.input[0] = n.input[0]
+                                consumer.output[0] = mul_input_name
+                                graph.node.insert(node_ind, new_mul)
+                                node_ind += 1
+                            graph.node.remove(n)
+                            node_ind -= 1
+                            graph_modified = True
         model = model.transform(InferShapes())
         return (model, graph_modified)
 
@@ -896,11 +923,13 @@ class MoveOpPastFork(Transformation):
                 for consumer_node in consumers[1:]:
                     # create new node
                     new_output_tensor_name = model.make_new_valueinfo_name()
+                    model.set_tensor_datatype(new_output_tensor_name, model.get_tensor_datatype(n.output[0]))
                     if op_init_param is None:
                         new_inp_list = [n.input[0]]
                     else:
                         new_param_name = model.make_new_valueinfo_name()
                         new_inp_list = [n.input[0], new_param_name]
+                        model.set_tensor_datatype(new_param_name, model.get_tensor_datatype(n.input[1]))
                         model.set_initializer(new_param_name, op_init_param)
                     new_node = deepcopy(n)
                     new_node.input[:] = new_inp_list
@@ -943,6 +972,55 @@ class MoveLinearPastFork(MoveOpPastFork):
 class MoveTransposePastFork(MoveOpPastFork):
     def __init__(self):
         super().__init__(["Transpose"])
+
+
+class MoveMatMulPastFork(MoveOpPastFork):
+    def __init__(self):
+        super().__init__(["MatMul"])
+
+
+class MoveMultiThresholdBeforeFork(Transformation):
+    def apply(self, model):
+        graph = model.graph
+        modified = False
+
+        for node in graph.node:
+            if node.op_type == "MultiThreshold":
+                # Find the producer of this MultiThreshold
+                producer = model.find_producer(node.input[0])
+                if producer is None:
+                    continue
+
+                # Check if the producer's output is consumed by multiple nodes
+                consumers = model.find_consumers(producer.output[0])
+                if len(consumers) <= 1:
+                    continue
+
+                # Check if there's another MultiThreshold among the consumers
+                multi_thresholds = [n for n in consumers if n.op_type == "MultiThreshold" and n != node]
+                if not multi_thresholds:
+                    continue
+
+                # Compare initializers
+                init1 = model.get_initializer(node.input[1])
+                for mt_node in multi_thresholds:
+                    init2 = model.get_initializer(mt_node.input[1])
+                    if init1 is not None and init2 is not None and np.array_equal(init1, init2):                     
+                        mt_node_consumer = model.find_consumers(mt_node.output[0])
+                        # Update consumers
+                        for consumer in mt_node_consumer:
+                            for i, input_name in enumerate(consumer.input):
+                                if input_name == mt_node.output[0]:
+                                    consumer.input[i] = node.output[0]
+                        
+    
+                        graph.node.remove(mt_node)
+                        
+                        modified = True
+                        break  # We've moved the nodes, so we can stop checking other MultiThresholds
+        
+        model = model.transform(InferShapes())
+        return (model, modified)
 
 
 class MoveMaxPoolPastMultiThreshold(Transformation):
@@ -1211,7 +1289,202 @@ class MoveTransposePastScalarMul(Transformation):
             model = model.transform(InferDataLayouts())
             model = model.transform(InferShapes())
         return (model, graph_modified)
+    
 
+class MoveTransposePastMul(Transformation):
+    """Moves a Transpose node past a Mul node, permuting the Mul"""
+
+    def apply(self, model):
+        graph = model.graph
+        node_ind = 0
+        graph_modified = False
+        for n in graph.node:
+            node_ind += 1
+            if n.op_type == "Transpose" and not model.is_fork_node(n) and not model.is_join_node(n):
+                consumer = model.find_consumer(n.output[0])
+                if (
+                    consumer is not None
+                    and consumer.op_type == "Mul"
+                    and not model.is_join_node(consumer)
+                ):
+                    mul_weight_name = consumer.input[1]
+                    A = model.get_initializer(mul_weight_name)
+                    if A is None:
+                        warnings.warn("Mul param is not constant, skipping")
+                        continue
+                    transp_node = n
+                    mul_node = consumer
+                    start_name = transp_node.input[0]
+                    middle_name = transp_node.output[0]
+                    end_name = mul_node.output[0]
+                    transp_in_shape = model.get_tensor_shape(start_name)
+                    transp_out_shape = model.get_tensor_shape(middle_name)
+                    transp_in_layout = model.get_tensor_layout(start_name)
+                    transp_out_layout = model.get_tensor_layout(middle_name)
+                    if transp_in_layout is None or transp_out_layout is None:
+                        warnings.warn(
+                            """Datalayout is not set for tensors.
+                            Transformation can't be applied."""
+                        )
+                        continue
+                    
+
+                    # if the mul is scalar, we can simply swap the order of ops
+                    if not all(x == 1 for x in A.shape):
+                        # Permute the mul weight according to the transpose
+                        perm = get_by_name(transp_node.attribute, "perm").ints
+                        A_permuted = np.transpose(A, np.argsort(perm))
+                        
+                        # Update the mul weight
+                        model.set_initializer(mul_weight_name, A_permuted)
+                    
+                    # Rewire the nodes
+                    mul_node.input[0] = start_name
+                    model.set_tensor_shape(start_name, transp_in_shape)
+                    model.set_tensor_layout(start_name, transp_in_layout)
+                    mul_node.output[0] = middle_name
+                    model.set_tensor_shape(middle_name, transp_in_shape)
+                    model.set_tensor_layout(middle_name, transp_in_layout)
+                    transp_node.input[0] = middle_name
+                    transp_node.output[0] = end_name
+                    model.set_tensor_shape(end_name, transp_out_shape)
+                    model.set_tensor_layout(end_name, transp_out_layout)
+                    
+                    # Reorder the nodes in the graph
+                    graph.node.remove(transp_node)
+                    graph.node.insert(node_ind, transp_node)
+                    graph_modified = True
+
+        if graph_modified:
+            model = model.transform(InferDataLayouts())
+            model = model.transform(InferShapes())
+        return (model, graph_modified)
+    
+
+class MoveTransposePastAdd(Transformation):
+    """Moves a Transpose node past a Add node, permuting the Add"""
+
+    def apply(self, model):
+        graph = model.graph
+        node_ind = 0
+        graph_modified = False
+        for n in graph.node:
+            node_ind += 1
+            if n.op_type == "Transpose" and not model.is_fork_node(n) and not model.is_join_node(n):
+                consumer = model.find_consumer(n.output[0])
+                if (
+                    consumer is not None
+                    and consumer.op_type == "Add"
+                    and not model.is_join_node(consumer)
+                    and not model.is_fork_node(consumer)
+                ):
+                    mul_weight_name = consumer.input[1]
+                    A = model.get_initializer(mul_weight_name)
+                    if A is None:
+                        warnings.warn("Mul param is not constant, skipping")
+                        continue
+                    transp_node = n
+                    mul_node = consumer
+                    start_name = transp_node.input[0]
+                    middle_name = transp_node.output[0]
+                    end_name = mul_node.output[0]
+                    transp_in_shape = model.get_tensor_shape(start_name)
+                    transp_out_shape = model.get_tensor_shape(middle_name)
+                    transp_in_layout = model.get_tensor_layout(start_name)
+                    transp_out_layout = model.get_tensor_layout(middle_name)
+                    if transp_in_layout is None or transp_out_layout is None:
+                        warnings.warn(
+                            """Datalayout is not set for tensors.
+                            Transformation can't be applied."""
+                        )
+                        continue
+                    
+
+                    # if the mul is scalar, we can simply swap the order of ops
+                    if not all(x == 1 for x in A.shape):
+                        # Permute the mul weight according to the transpose
+                        perm = get_by_name(transp_node.attribute, "perm").ints
+                        A_permuted = np.transpose(A, np.argsort(perm))
+                        
+                        # Update the mul weight
+                        model.set_initializer(mul_weight_name, A_permuted)
+                    
+                    # Rewire the nodes
+                    mul_node.input[0] = start_name
+                    model.set_tensor_shape(start_name, transp_in_shape)
+                    model.set_tensor_layout(start_name, transp_in_layout)
+                    mul_node.output[0] = middle_name
+                    model.set_tensor_shape(middle_name, transp_in_shape)
+                    model.set_tensor_layout(middle_name, transp_in_layout)
+                    transp_node.input[0] = middle_name
+                    transp_node.output[0] = end_name
+                    model.set_tensor_shape(end_name, transp_out_shape)
+                    model.set_tensor_layout(end_name, transp_out_layout)
+                    
+                    # Reorder the nodes in the graph
+                    graph.node.remove(transp_node)
+                    graph.node.insert(node_ind, transp_node)
+                    graph_modified = True
+
+        if graph_modified:
+            model = model.transform(InferDataLayouts())
+            model = model.transform(InferShapes())
+        return (model, graph_modified)
+
+
+class MoveMultiThresholdPastTranspose(Transformation):
+    """For (MultiThreshold -> NCHWTranspose) move Transpose past MultiThreshold
+    and set its data_layout mode to NCHW."""
+
+    def apply(self, model):
+        graph = model.graph
+        node_ind = 0
+        graph_modified = False
+        nodes = [n for n in model.graph.node]
+        for n in nodes:
+            node_ind += 1
+            if n.op_type == "MultiThreshold":
+                transpose_cand = model.find_consumer(n.output[0])
+                if (
+                    transpose_cand is not None
+                    and transpose_cand.op_type == "Transpose"
+                    and not model.is_fork_node(transpose_cand)
+                ):
+                    perms = list(get_by_name(transpose_cand.attribute, "perm").ints)
+                    if perms == [0, 2, 3, 1]:
+                        transpose_cand_orig_output = transpose_cand.output[0]
+                        mt = getCustomOp(n)
+                        mt.set_nodeattr("data_layout", "NHWC")
+                        # Rewire input of MultiThreshold node
+                        intermediate_tensor_name = model.make_new_valueinfo_name()
+                        intermediate_tensor_shape = model.get_tensor_shape(transpose_cand.output[0])
+                        intermediate_tensor_finn_dtype = model.get_tensor_datatype(n.input[0])
+                        # Create a new ValueInfoProto and set the shape
+                        model.set_tensor_shape(intermediate_tensor_name, intermediate_tensor_shape)
+                        # Set the tensor layout
+                        model.set_tensor_layout(intermediate_tensor_name, DataLayout.NHWC)
+                        # Set the tensor FINN datatype
+                        model.set_tensor_datatype(
+                            intermediate_tensor_name, intermediate_tensor_finn_dtype
+                        )
+                        # Create new Transpose node
+                        new_transpose = oh.make_node(
+                            "Transpose",
+                            [n.input[0]],
+                            [intermediate_tensor_name],
+                            perm=[0, 2, 3, 1],
+                        )
+                        graph.node.insert(node_ind - 1, new_transpose)
+                        # Rewire input of MultiThreshold node
+                        n.input[0] = intermediate_tensor_name
+                        # Rewire output of MultiThreshold node
+                        n.output[0] = transpose_cand_orig_output
+                        # Get rid of original transpose node
+                        graph.node.remove(transpose_cand)
+                        graph_modified = True
+        if graph_modified:
+            model = model.transform(InferDataTypes())
+        return (model, graph_modified)
 
 class MoveIdenticalOpPastJoinOp(Transformation):
     """
